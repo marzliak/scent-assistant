@@ -47,7 +47,7 @@ from .const import (
     SM_GW_DP_CUSTOMIZE_GEAR, SM_GW_DP_REMARK,
     SM_GW_PASSWORD_MARKER, SM_GW_PASSWORD_OK_BYTE,
     SM_GW_INIT_PACKET, SM_GW_HEARTBEAT_HEX, SM_GW_XOR_DICT,
-    AROMELY_SERVICE_UUID, AROMELY_CHAR_WRITE_UUID, AROMELY_CHAR_NOTIFY_UUID,
+    AROMELY_CHAR_NOTIFY_UUID, AROMELY_CHAR_WRITE_UUID, AROMELY_SERVICE_UUID,
     AROMELY_ADV_SERVICE_UUID,
     AROMELY_FRAME_HEADER, AROMELY_DIR_WRITE, AROMELY_DIR_NOTIFY,
     AROMELY_TYPE_READ, AROMELY_TYPE_DATA,
@@ -2171,8 +2171,22 @@ class B501FBleProtocol(BleProtocol):
     """
 
     device_type = DeviceType.B501F
-    # Uses the same FFF0 family as the base class (service FFF0, write FFF2,
-    # notify FFF1) — no GATT override needed.
+    # This unit's GATT lives in the FFE family, not the FFF family inherited
+    # from the base class. Field evidence (HA core log, 2026-09-12):
+    #   - FFF1/FFF2 -> "Characteristic not found" (base class, broken)
+    #   - FFE1      -> start_notify OK (no warning in log)
+    #   - FFE2      -> "Characteristic not found"
+    # The Scent Tech app's GATT candidate table (defpackage/mg.java) ships
+    # three fallback sets for devices of this OEM, every one of them
+    # anchored on FFE1:
+    #   [FFE0, FFE1, FFF0, 18AA]
+    #   [FFE1, FFF1, 2AAA]
+    #   [FFE1, 2AAA, FFF2]
+    # => FFE1 is the universal write+notify char (single-char mode, same
+    #    pattern as SM_AK/SM_GW). FFE2 is absent from every set.
+    service_uuid = AROMELY_SERVICE_UUID
+    write_char_uuid = AROMELY_CHAR_NOTIFY_UUID
+    notify_char_uuid = AROMELY_CHAR_NOTIFY_UUID
 
     @staticmethod
     def _checksum(payload_with_head: bytes) -> int:
