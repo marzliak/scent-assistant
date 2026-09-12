@@ -67,6 +67,10 @@ from .const import (
     AL_FAN_ON_VALUE, AL_FAN_OFF_VALUE,
     AL_SLOT_ENABLED, AL_SLOT_DISABLED,
     AL_PHASE_IDLE, AL_PHASE_SPRAYING, AL_PHASE_PAUSED,
+    B501F_CMD_POWER, B501F_FUNC_POWER, B501F_FUNC_FAN, B501F_FUNC_LOCK,
+    B501F_CMD_TIME_SYNC, B501F_CMD_QUERY_STATE, B501F_CMD_KEEPALIVE,
+    B501F_STATE_CMD, B501F_STATE_MASK_OFFSET, B501F_STATE_OIL_OFFSET,
+    B501F_FRAME_HEADER, B501F_FRAME_TRAILER,
 )
 
 import json
@@ -2142,6 +2146,143 @@ class ScentMarketingGwXorProtocol(ScentMarketingGwProtocol):
 # Factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# YooAI Scent-B501F — Dialect A (55 AA ... 5A), reverse-engineered from the
+# official Scent Tech app's live XLog (2026-09-12, 681 frames, 0 checksum
+# failures). Same FFF0/FFF1/FFF2 GATT layout as Aroma-Link, so it gets the
+# base BleProtocol GATT defaults — only the frame dialect differs.
+# ---------------------------------------------------------------------------
+class B501FBleProtocol(BleProtocol):
+    """YooAI Scent-B501F (Scent Tech app) BLE protocol.
+
+    Frame: 55 AA [len] [cmd] [body...] [chk] 5A
+      len  = bytes from len through chk inclusive (1 = cmd only, i.e. bare
+             acks like `55 AA 01 00 02 FA 5A`); body = frame[4 : 7+len].
+      chk  = (256 - sum(frame[0:-2]) % 256) & 0xFF   (validated 681/681)
+
+    TX (app -> device): `07 <func> <val> 00`  with func 0x10 lock / 0x11 fan
+    / 0x12 power, val 0x00 off / 0x01 on; `06 <ts LE 4>` time sync; `A1`
+    keep-alive; `08` state request (device acks `02 87 00`).
+    RX (device -> app): `0x21` full state (`frame[8]` mask
+    bit0 power / bit1 lock / bit2 fan; `frame[12]` oil — firmware constant
+    on this unit, no level sensor), `0x88` timers (5 slots x 16 B),
+    `0x89` oil/liquid (constant), `0xD1` device ID (SN + MAC + UUID),
+    `02 86 00` / `02 87 00` / `02 C7 00` command acks.
+    """
+
+    device_type = DeviceType.B501F
+    # Uses the same FFF0 family as the base class (service FFF0, write FFF2,
+    # notify FFF1) — no GATT override needed.
+
+    @staticmethod
+    def _checksum(payload_with_head: bytes) -> int:
+        """(256 - sum % 256) & 0xFF over every byte before the last two."""
+        return (256 - (sum(payload_with_head) % 256)) & 0xFF
+
+    @classmethod
+    def _build(cls, cmd: int, body: bytes = b"") -> bytes:
+        """Wrap `cmd` + body in the 55 AA envelope.
+
+        len field = number of bytes from cmd through body (inclusive),
+        i.e. 1 (cmd) + len(body). Total frame = 5 + len (hdr2 + len1 +
+        cmd+body + chk1 + trailer1). Verified against all 16 captured
+        TX frames and 493 RX frames (493/493 checksum OK).
+        """
+        head = B501F_FRAME_HEADER + bytes([len(body) + 1, cmd]) + body
+        return head + bytes([cls._checksum(head)]) + bytes([B501F_FRAME_TRAILER])
+
+    # -- TX ----------------------------------------------------------------
+
+    def build_power(self, on: bool) -> bytes:
+        return self._build(B501F_CMD_POWER,
+                           bytes([B501F_FUNC_POWER, 0x01 if on else 0x00, 0x00]))
+
+    def build_fan(self, on: bool) -> bytes:
+        return self._build(B501F_CMD_POWER,
+                           bytes([B501F_FUNC_FAN, 0x01 if on else 0x00, 0x00]))
+
+    def build_lock(self, on: bool) -> bytes:
+        return self._build(B501F_CMD_POWER,
+                           bytes([B501F_FUNC_LOCK, 0x01 if on else 0x00, 0x00]))
+
+    def build_heartbeat(self) -> bytes:
+        return self._build(B501F_CMD_KEEPALIVE)
+
+    def build_query(self) -> bytes:
+        """Device state request — the device replies `02 87 00` then a 0x21."""
+        return self._build(B501F_CMD_QUERY_STATE)
+
+    def build_time_sync(self, now: datetime | None = None) -> bytes | None:
+        if now is None:
+            now = datetime.now()
+        ts = int(now.timestamp()) & 0xFFFFFFFF
+        return self._build(B501F_CMD_TIME_SYNC,
+                           bytes([(ts >> 0) & 0xFF, (ts >> 8) & 0xFF,
+                                  (ts >> 16) & 0xFF, (ts >> 24) & 0xFF]))
+
+    def supports_fan(self) -> bool:
+        return True
+
+    # -- RX ----------------------------------------------------------------
+
+    @staticmethod
+    def _feed(raw: bytes) -> bytes | None:
+        """Return a complete 55 AA ... 5A frame if one is present in `raw`,
+        else None (caller should pass the raw notification; the device sends
+        exactly one frame per GATT notification, so no buffering is needed —
+        the longest captured frame was 86 bytes, fitting the default MTU of
+        512 used by HA's bleak transport)."""
+        if len(raw) < 5 or raw[0] != 0x55 or raw[1] != 0xAA:
+            return None
+        if raw[-1] != B501F_FRAME_TRAILER:
+            # Tolerate a trailing pad byte from some controllers.
+            if len(raw) < 6 or raw[-2] != B501F_FRAME_TRAILER:
+                return None
+            raw = raw[:-1]
+        length = raw[2]
+        total = 4 + length + 1              # hdr2 + len1 + (cmd..body) + chk1
+        if len(raw) < total:
+            return None
+        # some controllers pad one byte before the trailer; drop it
+        if len(raw) == total + 1 and raw[total] == B501F_FRAME_TRAILER:
+            raw = raw[:total]
+        if len(raw) != total or raw[-1] != B501F_FRAME_TRAILER:
+            return None
+        frame = raw
+        if (256 - (sum(frame[:-2]) % 256)) & 0xFF != frame[-2]:
+            return None
+        return frame
+
+    def parse_notification(self, data: bytes) -> dict:
+        result: dict = {}
+        frame = self._feed(bytes(data))
+        if frame is None:
+            return result
+        cmd = frame[3]
+        body = frame[4:-2]                     # bytes between cmd and chk
+
+        if cmd == B501F_STATE_CMD:
+            if len(frame) > 8:
+                mask = frame[8]
+                result["power"] = bool(mask & 0x01)
+                result["lock"]  = bool(mask & 0x02)
+                result["fan"]   = bool(mask & 0x04)
+                result["phase"] = "off" if not (mask & 0x01) else "on"
+            # frame[12] is firmware-constant on B501F (no oil level sensor,
+            # confirmed per-unit on the 2026-09-12 capture); don't expose
+            # it as oil_remaining.
+
+        elif cmd == 0x88:
+            count = (body[1] << 8) | body[0] if len(body) >= 2 else 0
+            if count:
+                result["schedule_enabled"] = True
+
+        elif cmd >= 0x80:
+            result["ack"] = cmd
+
+        return result
+
+
 def get_protocol(
     device_type: DeviceType,
     mac: str = "",
@@ -2167,6 +2308,8 @@ def get_protocol(
         return ScentMarketingGwXorProtocol(mac=mac, tuya_dp_mode=tuya)
     elif device_type == DeviceType.AROMELY_ARO_MAX:
         return AromelyAroMaxProtocol()
+    elif device_type == DeviceType.B501F:
+        return B501FBleProtocol()
     raise ValueError(f"Unknown device type: {device_type}")
 
 

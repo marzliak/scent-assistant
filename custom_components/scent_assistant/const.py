@@ -15,6 +15,7 @@ class DeviceType(StrEnum):
     SCENT_MARKETING_GW = "scent_marketing_gw"          # Scent Marketing app, GW family (EE01 service, framed DP protocol)
     SCENT_MARKETING_GW_XOR = "scent_marketing_gw_xor"  # Scent Marketing app, GW family with XOR-encrypted JSON payload
     AROMELY_ARO_MAX = "aromely_aro_max"                # Aromely Aro Max (FFE0 service, 55-framed register protocol)
+    B501F = "b501f"                                    # YooAI Scent-B501F (FFF0/1/2, 55 AA dialect)
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +198,14 @@ SM_GW_ALT_WRITE_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
 # ---------------------------------------------------------------------------
 
 BLE_NAME_PATTERNS = {
+    # "Scent-B501" — YooAI Scent-B501F (Scent Tech app, com.yooai.scentlife)
+    # advertises a per-unit serial name. Must come FIRST (most specific)
+    # so a plain "Scent " / "Scent-" device doesn't swallow it.
+    # The protocol is the 55 AA (Dialect A / YooAI native) framing —
+    # see B501FBleProtocol in protocol_ble.py.
+    DeviceType.B501F: ["Scent-B501"],
     # "Scent " — Aroma-Link / JCloud / Cavir / Crearoma (Dewoo OEM, Aroma-Link app)
-    # "Scent-" — newer AromaLink/Scent-B devices advertise a hyphenated serial
-    # name instead (e.g. "Scent-B501F0412170ACE")
+    # "Scent-" — older Aroma-Link family hyphenated serials
     # "DAP.A5" — DAP Smart Scent Air Machine (Dewoo OEM, AromaPlan app)
     DeviceType.AROMA_LINK: ["Scent ", "Scent-", "DAP.A5"],
     DeviceType.TUYA_BLE: ["BT-ivy"],
@@ -307,6 +313,61 @@ AL_SLOT_DISABLED = 0x10
 AL_PHASE_IDLE = 0x00
 AL_PHASE_SPRAYING = 0x01
 AL_PHASE_PAUSED = 0x02
+
+# ---------------------------------------------------------------------------
+# YooAI Scent-B501F — Dialect A (55 AA ... 5A), reverse-engineered from the
+# official Scent Tech app's live XLog (2026-09-12, 681 frames, 0 checksum
+# failures). The device uses the same FFF0/FFF1/FFF2 GATT layout as
+# Aroma-Link (write FFF2 / notify FFF1 via the FFF0 service) but a different
+# frame dialect, so it gets its own protocol class.
+#
+# Frame: 55 AA [len] [cmd] [body...] [chk] 5A
+#   len  = bytes from here through chk inclusive (1 = cmd only)
+#   chk  = (256 - sum(frame[0:-2]) % 256) & 0xFF   (validated 681/681)
+#
+# TX commands (app -> device) — all captured live:
+#   07 <func> <val> 00  control:  func 0x12 power / 0x11 fan / 0x10 lock
+#   06 <ts LE 4>     time sync
+#   08               request full state (responded with ack 02 87 00)
+#   09 01 00         set mode / PIN BLE (handshake, step 2)
+#   47               handshake step 1 ("I am ready")
+#   51               handshake step 3 ("subscribe to notifies")
+#   A1               keep-alive / heartbeat
+#
+# RX commands (device -> app) — all captured live:
+#   21  full state (mask bit0=power bit1=lock bit2=fan at frame[8])
+#   88  timers (count + 5 x 16-byte slots)
+#   89  oil/liquid status (constant on this unit — no level sensor)
+#   D1  device identification (SN + MAC + 32-char UUID)
+#   86  time-sync ack (02 86 00)
+#   87  operation success ack (02 87 00)
+#   C7  sub-ack (response to cmd 0x47)
+
+B501F_FRAME_HEADER = bytes([0x55, 0xAA])
+B501F_FRAME_TRAILER = 0x5A
+
+B501F_CMD_POWER = 0x07
+B501F_FUNC_POWER = 0x12
+B501F_FUNC_FAN = 0x11
+B501F_FUNC_LOCK = 0x10
+
+B501F_CMD_TIME_SYNC = 0x06
+B501F_CMD_QUERY_STATE = 0x08
+B501F_CMD_HANDSHAKE_1 = 0x47
+B501F_CMD_HANDSHAKE_2 = 0x09
+B501F_CMD_HANDSHAKE_3 = 0x51
+B501F_CMD_KEEPALIVE = 0xA1
+
+B501F_STATE_CMD = 0x21
+B501F_STATE_MASK_OFFSET = 8     # bit0 power, bit1 lock, bit2 fan
+B501F_STATE_OIL_OFFSET = 12     # firmware constant on this unit (no sensor)
+
+B501F_CMD_TIMERS = 0x88
+B501F_CMD_STATE_ACK = 0x87
+B501F_CMD_TIMESYNC_ACK = 0x86
+B501F_CMD_SUB09_ACK = 0xC7
+B501F_CMD_INFO = 0xD1
+B501F_CMD_OIL = 0x89
 
 # ---------------------------------------------------------------------------
 # Scent Marketing — GW family DP-frame protocol constants

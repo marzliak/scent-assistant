@@ -17,6 +17,7 @@ SCENT_MARKETING_TYPES = {
     DeviceType.SCENT_MARKETING_AK,
     DeviceType.SCENT_MARKETING_GW,
     DeviceType.SCENT_MARKETING_GW_XOR,
+    DeviceType.B501F,
 }
 
 

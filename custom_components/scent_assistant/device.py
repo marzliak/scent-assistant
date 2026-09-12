@@ -32,6 +32,7 @@ from .protocol_ble import (
     ScentimentProtocol,
     ScentMarketingAkProtocol,
     ScentMarketingGwProtocol,
+    B501FBleProtocol,
     ScentMarketingGwXorProtocol,
     AromelyAroMaxProtocol,
     get_protocol,
@@ -845,7 +846,7 @@ class ScentDiffuserDevice:
         if not self._ble_address:
             return False
         proto = self._protocol
-        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol)):
+        if isinstance(proto, (AromaLinkBleProtocol, ScentMarketingAkProtocol, AromelyAroMaxProtocol, B501FBleProtocol)):
             cmd = proto.build_fan(on)
             if await self._ble_execute(cmd):
                 self._state.fan = on
@@ -858,7 +859,7 @@ class ScentDiffuserDevice:
         if not self._ble_address:
             return False
         proto = self._protocol
-        if isinstance(proto, (ScentMarketingAkProtocol, ScentMarketingGwProtocol)):
+        if isinstance(proto, (ScentMarketingAkProtocol, ScentMarketingGwProtocol, B501FBleProtocol)):
             cmd = proto.build_lock(on)
             if await self._ble_execute(cmd):
                 self._state.lock = on
