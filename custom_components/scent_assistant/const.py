@@ -198,8 +198,10 @@ SM_GW_ALT_WRITE_UUID = "0000ff03-0000-1000-8000-00805f9b34fb"
 
 BLE_NAME_PATTERNS = {
     # "Scent " — Aroma-Link / JCloud / Cavir / Crearoma (Dewoo OEM, Aroma-Link app)
+    # "Scent-" — newer AromaLink/Scent-B devices advertise a hyphenated serial
+    # name instead (e.g. "Scent-B501F0412170ACE")
     # "DAP.A5" — DAP Smart Scent Air Machine (Dewoo OEM, AromaPlan app)
-    DeviceType.AROMA_LINK: ["Scent ", "DAP.A5"],
+    DeviceType.AROMA_LINK: ["Scent ", "Scent-", "DAP.A5"],
     DeviceType.TUYA_BLE: ["BT-ivy"],
     DeviceType.SCENTIMENT: ["Scentiment"],
     # Most Aro Max units advertise a per-unit serial as the local name and
