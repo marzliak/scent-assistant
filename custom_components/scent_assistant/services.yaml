@@ -72,3 +72,34 @@ set_schedule:
       default: true
       selector:
         boolean:
+set_slot:
+  name: Set Slot
+  description: "Enable or disable one B501F timer slot (I-V). Slots are independent and can coexist."
+  target:
+    entity:
+      integration: scent_assistant
+  fields:
+    slot:
+      name: Slot
+      description: "Timer slot number (1=I, 2=II, ... 5=V)"
+      required: true
+      selector:
+        select:
+          options:
+            - label: "Mode I"
+              value: "1"
+            - label: "Mode II"
+              value: "2"
+            - label: "Mode III"
+              value: "3"
+            - label: "Mode IV"
+              value: "4"
+            - label: "Mode V"
+              value: "5"
+    enabled:
+      name: Enabled
+      description: "Enable (true) or disable (false) this slot"
+      required: true
+      default: true
+      selector:
+        boolean:

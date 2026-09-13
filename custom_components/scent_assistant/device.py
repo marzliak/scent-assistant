@@ -428,6 +428,34 @@ class ScentDiffuserDevice:
                         self._ble_last_failure_ts = loop.time()
                         return False
 
+                # B501F (Scent Tech / YooAI) — session handshake mirroring
+                # the Scent Tech app order (XLog 2026-09-12): 09 ack →
+                # 51 sub → 06 time sync → 08 state request, to which the
+                # device replies 21 (state) + 88 (timer table) + 89 (oil).
+                # Without the 08 request the firmware never pushes the
+                # 0x88 slots, so the mode entities would start blank.
+                if isinstance(self._protocol, B501FBleProtocol):
+                    try:
+                        await self._ble_send(self._protocol.build_handshake_1())
+                        await asyncio.sleep(0.15)
+                        await self._ble_send(self._protocol.build_handshake_2())
+                        await asyncio.sleep(0.15)
+                        b_time = self._protocol.build_time_sync()
+                        if b_time:
+                            await self._ble_send(b_time)
+                            await asyncio.sleep(0.15)
+                            self._ble_has_synced_time = True
+                        await self._ble_send(self._protocol.build_query())
+                        await asyncio.sleep(0.4)
+                    except (BleakError, asyncio.TimeoutError, OSError) as err:
+                        _LOGGER.warning(
+                            "B501F handshake failed on %s: %s",
+                            self._ble_name, err,
+                        )
+                        await self._teardown_ble_client()
+                        self._ble_last_failure_ts = loop.time()
+                        return False
+
                 # Aromely Aro Max — the app opens every session with a
                 # session-start frame, then a time sync, then reads back
                 # the name / label / schedule. We mirror that so HA starts
@@ -624,6 +652,12 @@ class ScentDiffuserDevice:
         self._recent_notifications.append(raw.hex())
         if len(self._recent_notifications) > 20:
             del self._recent_notifications[0]
+        # B501F: surface the timer-table (0x88) raw bytes at WARNING level
+        # (HA core-level log filter is WARNING; INFO is hidden by default so
+        # these would never show up without toggling integration debug).
+        if isinstance(self._protocol, B501FBleProtocol) and len(raw) >= 5 and raw[3] == 0x88:
+            _LOGGER.warning(
+                "B501F 0x88 RX (%d bytes): %s", len(raw), raw.hex(" "))
         updates = self._protocol.parse_notification(raw)
         if not updates:
             return
@@ -715,6 +749,20 @@ class ScentDiffuserDevice:
             changed = True
         if "schedule_enabled" in updates:
             self._state.schedule_enabled = updates["schedule_enabled"]
+            changed = True
+        if "b501f_timers" in updates:
+            self._state.b501f_timers = updates["b501f_timers"]
+            changed = True
+        if "b501f_active_slot" in updates:
+            self._state.b501f_active_slot = updates["b501f_active_slot"]
+            changed = True
+        if "start_hour" in updates:
+            self._state.start_hour = updates["start_hour"]
+            self._state.start_minute = updates.get(
+                "start_minute", self._state.start_minute)
+            self._state.end_hour = updates.get("end_hour", self._state.end_hour)
+            self._state.end_minute = updates.get(
+                "end_minute", self._state.end_minute)
             changed = True
 
         # Derive oil days-remaining from the latest oil + schedule state.
@@ -865,6 +913,70 @@ class ScentDiffuserDevice:
                 self._state.lock = on
                 self._notify_state_changed()
                 return True
+        return False
+
+    async def set_active_mode(self, mode: int) -> bool:
+        """Switch the B501F active timer mode (1-5, the app's I-V selector).
+
+        Enables the target slot (preserving its other fields) and leaves the
+        flags of every other slot UNCHANGED — the model reflects the app's
+        real behaviour where multiple slots can coexist (weekend vs weekday),
+        so we don't force exclusivity. The shared state fields track the
+        newly-selected slot so number/time edits land on it.
+        """
+        return await self.set_slot_enabled(mode, True)
+
+    async def set_slot_enabled(self, slot: int, enabled: bool) -> bool:
+        """Enable/disable one B501F slot.
+
+        Uses the app's real per-slot write command (CMD 0x14), which saves
+        ONE 16-byte timer record. This is what the Scent Tech app does in
+        `defpackage/rz.P(TimerVo)` — one frame per slot toggle. Every other
+        slot's flag/fields remain untouched (the firmware treats slots as
+        independent).
+        """
+        if not self._ble_address or not isinstance(self._protocol, B501FBleProtocol):
+            return False
+        base = self._state.b501f_timers
+        if not base:
+            _LOGGER.warning(
+                "B501F slot write on %s before the timer table was read",
+                self.name,
+            )
+            return False
+        if not (1 <= slot <= len(base)):
+            _LOGGER.warning("B501F invalid slot %s on %s", slot, self.name)
+            return False
+        # Copy only the fields 0x14 needs — verbatim from the 0x88 read.
+        target = dict(base[slot - 1])
+        target["enabled"] = bool(enabled)
+        cmd = self._protocol.build_set_timer_slot(target)
+        _LOGGER.warning(
+            "B501F 0x14 TX slot %d en=%s (%d bytes): %s",
+            slot, int(bool(enabled)), len(cmd), cmd.hex(" ")
+        )
+        if await self._ble_execute(cmd):
+            # Reflect the new flag locally (the device will also push a
+            # fresh 0x88 table shortly — we request one below so HA lands
+            # on the real state).
+            slots = [dict(s) for s in base]
+            slots[slot - 1]["enabled"] = bool(enabled)
+            self._state.b501f_timers = slots
+            self._state.b501f_active_slot = slot
+            self._state.schedule_slot = target["serial"] or slot
+            self._state.work_seconds = target["run_seconds"]
+            self._state.pause_seconds = target["pause_seconds"]
+            self._state.start_hour = target["start_minutes"] // 60
+            self._state.start_minute = target["start_minutes"] % 60
+            self._state.end_hour = target["stop_minutes"] // 60
+            self._state.end_minute = target["stop_minutes"] % 60
+            self._notify_state_changed()
+            # Read-back: force a table push so HA lands on the real state.
+            try:
+                await self._ble_send(self._protocol.build_query())
+            except (BleakError, asyncio.TimeoutError, OSError):
+                pass
+            return True
         return False
 
     async def set_lamp(self, on: bool) -> bool:
@@ -1105,6 +1217,39 @@ class ScentDiffuserDevice:
                     enabled=enabled, work_seconds=work, pause_seconds=pause,
                 )
                 cmd = self._protocol.build_schedule(slot, weekday_mask=weekday_mask)
+            elif isinstance(self._protocol, B501FBleProtocol):
+                # B501F: the app's real schedule-write is CMD 0x14 (one 16-byte
+                # slot record), NOT the 0x88 table save. We rewrite only the
+                # actively-edited slot (b501f_active_slot, set by the select /
+                # last toggle); the other four slots pass through verbatim on
+                # device side because 0x14 only carries the one record. If no
+                # table has been read yet we synthesise slot 1.
+                base = self._state.b501f_timers
+                if base and len(base) == 5:
+                    active_idx = 0
+                    if (self._state.b501f_active_slot is not None
+                            and 1 <= self._state.b501f_active_slot <= len(base)):
+                        active_idx = self._state.b501f_active_slot - 1
+                    else:
+                        active_idx = next(
+                            (i for i, s in enumerate(base) if s.get("enabled")), 0)
+                    slot = dict(base[active_idx])
+                else:
+                    slot = {"enabled": True, "serial": 1, "mode": 0,
+                            "start_minutes": 0, "stop_minutes": 0,
+                            "run_seconds": 0, "pause_seconds": 0, "timer_id": 0}
+                slot["enabled"] = True
+                slot["start_minutes"] = s_h * 60 + s_m
+                slot["stop_minutes"] = e_h * 60 + e_m
+                slot["run_seconds"] = work
+                slot["pause_seconds"] = pause
+                _LOGGER.warning(
+                    "B501F 0x14 schedule TX slot %d %02d:%02d-%02d:%02d w=%d p=%d",
+                    slot["serial"], s_h, s_m, e_h, e_m, work, pause)
+                cmd = self._protocol.build_set_timer_slot(slot)
+                _LOGGER.warning(
+                    "B501F 0x14 schedule payload (%d bytes): %s",
+                    len(cmd), cmd.hex(" "))
 
             if cmd and await self._ble_execute(cmd):
                 self._notify_state_changed()

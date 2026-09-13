@@ -70,7 +70,9 @@ from .const import (
     B501F_CMD_POWER, B501F_FUNC_POWER, B501F_FUNC_FAN, B501F_FUNC_LOCK,
     B501F_CMD_TIME_SYNC, B501F_CMD_QUERY_STATE, B501F_CMD_KEEPALIVE,
     B501F_STATE_CMD, B501F_STATE_MASK_OFFSET, B501F_STATE_OIL_OFFSET,
-    B501F_FRAME_HEADER, B501F_FRAME_TRAILER,
+    B501F_FRAME_HEADER, B501F_FRAME_TRAILER, B501F_CMD_TIMERS,
+    B501F_CMD_SET_TIMER_SLOT, B501F_CMD_SET_TIMER_SLOT_ACK,
+    B501F_CMD_HANDSHAKE_2, B501F_CMD_HANDSHAKE_3,
 )
 
 import json
@@ -158,6 +160,19 @@ class DiffuserState:
     # though Power+Fan look active. On V2 this duplicates `power`
     # because V2 firmware only has the one toggle.
     schedule_enabled: bool | None = None
+    # B501F (Scent Tech) — full 5-slot timer table as read from the
+    # 0x88 frame, list of dicts:
+    #   {enabled, serial, mode, start_minutes, stop_minutes,
+    #    run_seconds, pause_seconds, timer_id}
+    # `enabled` marks the user-selected active mode (the app's I-V
+    # selector); `serial` is the 1-based slot number. None until the
+    # first 0x88 read after connect.
+    b501f_timers: list | None = None
+    # B501F: which slot (1-5) the user is editing — set when the user
+    # selects a mode (enabling it), so number/time writes follow that slot
+    # even if another was recently enabled. Falls back to "first enabled"
+    # when unset.
+    b501f_active_slot: int | None = None
 
 
 @dataclass
@@ -2226,6 +2241,16 @@ class B501FBleProtocol(BleProtocol):
         """Device state request — the device replies `02 87 00` then a 0x21."""
         return self._build(B501F_CMD_QUERY_STATE)
 
+    def build_handshake_1(self) -> bytes:
+        """Session-open frame from the Scent Tech app (XLog 2026-09-12):
+        `55 AA 03 09 01 00 F4 5A` — must precede the 0x51 sub frame."""
+        return self._build(B501F_CMD_HANDSHAKE_2, bytes([0x01, 0x00]))
+
+    def build_handshake_2(self) -> bytes:
+        """Session sub frame `55 AA 01 51 AF 5A` — device answers with
+        the 0xD1 identity block (SN + MAC + UUID)."""
+        return self._build(B501F_CMD_HANDSHAKE_3)
+
     def build_time_sync(self, now: datetime | None = None) -> bytes | None:
         if now is None:
             now = datetime.now()
@@ -2233,6 +2258,122 @@ class B501FBleProtocol(BleProtocol):
         return self._build(B501F_CMD_TIME_SYNC,
                            bytes([(ts >> 0) & 0xFF, (ts >> 8) & 0xFF,
                                   (ts >> 16) & 0xFF, (ts >> 24) & 0xFF]))
+
+    # -- B501F timers (5 slots, frame 0x88) ------------------------------
+    # Layout per the official Scent Tech app parser (com.yooai.scentlife.
+    # bean.device.TimerVo.getTimers/getTimer, 16 bytes/slot, little-endian
+    # shorts) -- confirmed by matching the captured 0x88 frame against the
+    # app UI: 5/5 slots match the on-screen timer definitions.
+    #
+    #   [0] enabled      1B  01 iff this is the user-selected active mode
+    #   [1] serial        1B  1-based slot number
+    #   [2-3]  mode      u16 LE  firmware metadata (preserved verbatim)
+    #   [4-5]  start_min u16 LE  minutes since midnight (0..1439)
+    #   [6-7]  stop_min  u16 LE  minutes since midnight
+    #   [8-9]  run_s     u16 LE  active phase seconds
+    #   [10-11] pause_s  u16 LE  pause phase seconds
+    #   [12-15] timer_id u32 LE  server-assigned id (preserved verbatim)
+    #
+    # Frame: 55 AA [len=0x53] 88 [count u16 LE] [5 x 16B] [chk] 5A
+    # (87 bytes + trailer; validated against XLog 2026-09-12 capture).
+    #
+    # Exactly ONE slot carries enabled=01 -- that is the app's I-V mode
+    # selector. Selecting a mode rewrites the table with the new slot
+    # flagged; we mirror that on TX.
+
+    @staticmethod
+    def _parse_b501f_timers(body: bytes) -> list | None:
+        """Decode a 0x88 payload (bytes after cmd) into a list of dicts."""
+        if len(body) < 2:
+            return None
+        count = (body[1] << 8) | body[0]
+        off = 2
+        slots = []
+        for _ in range(count):
+            if len(body) < off + 16:
+                return None
+            s = body[off:off + 16]
+            slots.append({
+                "enabled":     bool(s[0]),
+                "serial":      s[1],
+                "mode":        (s[3] << 8) | s[2],
+                "start_minutes": (s[5] << 8) | s[4],
+                "stop_minutes":  (s[7] << 8) | s[6],
+                "run_seconds":   (s[9] << 8) | s[8],
+                "pause_seconds": (s[11] << 8) | s[10],
+                "timer_id":    (s[15] << 24) | (s[14] << 16)
+                               | (s[13] << 8) | s[12],
+            })
+            off += 16
+        return slots
+
+    @staticmethod
+    def _b501f_slot_to_bytes(slot: dict) -> bytes:
+        """Encode ONE slot as its 16-byte record (layout identical in the
+        0x88 read table and the 0x14 single-slot write — the app's
+        `TimerVo.getTimer`/`rz.P` use the same field order):
+        [en][serial][mode LE16][start LE16][stop LE16][run LE16]
+        [suspend LE16][timer_id LE32]
+        """
+        def le16(v: int) -> bytes:
+            v &= 0xFFFF
+            return bytes([v & 0xFF, (v >> 8) & 0xFF])
+        def le32(v: int) -> bytes:
+            v &= 0xFFFFFFFF
+            return bytes([v & 0xFF, (v >> 8) & 0xFF,
+                          (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+        return (bytes([1 if slot.get("enabled") else 0,
+                       int(slot.get("serial", 1)) & 0xFF])
+                + le16(int(slot.get("mode", 0)))
+                + le16(int(slot.get("start_minutes", 0)))
+                + le16(int(slot.get("stop_minutes", 0)))
+                + le16(int(slot.get("run_seconds", 0)))
+                + le16(int(slot.get("pause_seconds", 0)))
+                + le32(int(slot.get("timer_id", 0))))
+
+    @staticmethod
+    def _b501f_timers_to_bytes(slots: list[dict]) -> bytes:
+        """Encode 5 slots into the 0x88 payload (count + slots)."""
+        out = bytearray([5, 0])
+        for s in slots:
+            out += B501FBleProtocol._b501f_slot_to_bytes(s)
+        return bytes(out)
+
+    def build_write_timers(self, slots: list[dict]) -> bytes:
+        """Build the 0x88 TX frame (re)saving the 5-slot timer table.
+
+        Field values (serial, mode, timer_id) pass THROUGH verbatim — the
+        device/app use them for identification and we must not rewrite
+        them. `enabled` also passes through verbatim: the firmware treats
+        each slot as an independent on/off (a weekend slot and a weekday
+        slot can coexist), so callers control the final flags directly.
+        """
+        norm = [dict(s) for s in slots[:5]]
+        while len(norm) < 5:
+            norm.append({"enabled": False, "serial": len(norm) + 1,
+                         "mode": 0, "start_minutes": 0, "stop_minutes": 0,
+                         "run_seconds": 0, "pause_seconds": 0,
+                         "timer_id": 0})
+        return self._build(B501F_CMD_TIMERS, self._b501f_timers_to_bytes(norm))
+
+    def build_set_timer_slot(self, slot: dict) -> bytes:
+        """Build the 0x14 TX frame — save ONE timer slot (the app's real
+        slot-toggle / schedule-write command).
+
+        Scent Tech app, `defpackage/rz.P(TimerVo)` → `BleUtils.getBytes(
+        16-byte record, CMD 20)`. CMD 20 decimal = 0x14. Frame:
+            55 AA 11 14 <16-byte slot record> CK 5A
+        The device answers `02 94 00` (0x14 | 0x80) with body 0x00 = ok.
+
+        The record MUST be the full current record (enable/serial/mode/
+        start/stop/run/suspend/timer_id) — only the caller flips the
+        `enabled` byte; every other byte is copied verbatim from the
+        last 0x88 read.
+        """
+        slot = dict(slot)
+        slot.setdefault("serial", 1)
+        record = self._b501f_slot_to_bytes(slot)
+        return self._build(B501F_CMD_SET_TIMER_SLOT, record)
 
     def supports_fan(self) -> bool:
         return True
@@ -2290,6 +2431,23 @@ class B501FBleProtocol(BleProtocol):
             count = (body[1] << 8) | body[0] if len(body) >= 2 else 0
             if count:
                 result["schedule_enabled"] = True
+                slots = self._parse_b501f_timers(body)
+                if slots:
+                    result["b501f_timers"] = slots
+                    # Surface the active slot's work/pause/hours into the
+                    # shared state so number/time entities bound to
+                    # `work_seconds`/`pause_seconds`/`start_hour` show
+                    # the right values for whichever mode is active.
+                    active = next((s for s in slots if s.get("enabled")), None)
+                    if active:
+                        result["work_seconds"] = active["run_seconds"]
+                        result["pause_seconds"] = active["pause_seconds"]
+                        result["start_hour"] = active["start_minutes"] // 60
+                        result["start_minute"] = active["start_minutes"] % 60
+                        result["end_hour"] = active["stop_minutes"] // 60
+                        result["end_minute"] = active["stop_minutes"] % 60
+                        result["schedule_slot"] = active["serial"]
+                        result["b501f_active_slot"] = active["serial"]
 
         elif cmd >= 0x80:
             result["ack"] = cmd

@@ -363,6 +363,8 @@ B501F_STATE_MASK_OFFSET = 8     # bit0 power, bit1 lock, bit2 fan
 B501F_STATE_OIL_OFFSET = 12     # firmware constant on this unit (no sensor)
 
 B501F_CMD_TIMERS = 0x88
+B501F_CMD_SET_TIMER_SLOT = 0x14  # write: save one 16-byte timer record (slot toggle / schedule edit)
+B501F_CMD_SET_TIMER_SLOT_ACK = 0x94  # device ACK for 0x14: body 00 = ok
 B501F_CMD_STATE_ACK = 0x87
 B501F_CMD_TIMESYNC_ACK = 0x86
 B501F_CMD_SUB09_ACK = 0xC7

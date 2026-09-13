@@ -28,7 +28,7 @@ from .const import (
     DeviceType,
 )
 from .device import ScentDiffuserDevice
-from .protocol_ble import ScheduleSlot, ScheduleSetup
+from .protocol_ble import B501FBleProtocol, ScheduleSlot, ScheduleSetup
 from .protocol_cloud import AromaLinkCloudClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +61,14 @@ SET_SCHEDULE_SCHEMA = vol.Schema({
         vol.Coerce(int), vol.Range(min=5, max=3600),
     ),
     vol.Optional("enabled", default=True): cv.boolean,
+    vol.Optional("entity_id"): cv.string,
+})
+
+SERVICE_SET_SLOT = "set_slot"
+
+SET_SLOT_SCHEMA = vol.Schema({
+    vol.Required("slot"): vol.All(vol.Coerce(int), vol.Range(min=1, max=5)),
+    vol.Required("enabled"): cv.boolean,
     vol.Optional("entity_id"): cv.string,
 })
 
@@ -191,6 +199,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_SET_SCHEDULE,
             handle_set_schedule,
             schema=SET_SCHEDULE_SCHEMA,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SET_SLOT):
+        async def handle_set_slot(call: ServiceCall) -> None:
+            """Handle the set_slot service call (enable/disable one timer slot)."""
+            slot = call.data["slot"]
+            enabled = call.data["enabled"]
+            entity_id = call.data.get("entity_id")
+
+            targets = []
+            for eid, dev in hass.data[DOMAIN].items():
+                if isinstance(dev, ScentDiffuserDevice) and \
+                        isinstance(dev._protocol, B501FBleProtocol):
+                    if entity_id is None or eid == entity_id:
+                        targets.append(dev)
+
+            if not targets:
+                _LOGGER.error("set_slot: no B501F diffuser found (slot=%s)", slot)
+                return
+
+            for dev in targets:
+                ok = await dev.set_slot_enabled(slot, enabled)
+                _LOGGER.info(
+                    "set_slot slot=%s enabled=%s -> %s (on %s)",
+                    slot, enabled, ok, dev.name,
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SET_SLOT,
+            handle_set_slot,
+            schema=SET_SLOT_SCHEMA,
         )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
