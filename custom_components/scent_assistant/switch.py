@@ -35,6 +35,14 @@ async def async_setup_entry(
     if device.supports_fan and not is_cloud:
         entities.append(DiffuserFanSwitch(device, entry))
 
+    # B501F: one independent switch per firmware timer slot (I-V).
+    # Maps 1:1 to the app's 5 mode buttons — the firmware has no
+    # "exclusive mode" concept, so slots can coexist (weekend vs weekday).
+    # See `B501FSlotSwitch` below.
+    if device.device_type == DeviceType.B501F and not is_cloud:
+        for slot_no in range(1, 6):
+            entities.append(B501FSlotSwitch(device, entry, slot_no))
+
     # Scent Marketing devices expose extra controls when running on BLE.
     if device.device_type in SCENT_MARKETING_TYPES and not is_cloud:
         entities.append(DiffuserLockSwitch(device, entry))
@@ -235,3 +243,78 @@ class DiffuserFanSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._device.set_fan(False)
+
+
+ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V"}
+
+
+class B501FSlotSwitch(SwitchEntity):
+    """One independent timer-slot switch (I-V) for B501F / Scent Tech.
+
+    Mirrors the Scent Tech app's five mode buttons: turning a slot ON
+    enables it on the firmware (CMD 0x14, its other fields preserved)
+    and turning it OFF disables just that slot. Slots coexist — e.g.
+    slot I at 19:00-22:00 on weekdays and slot II at a different window
+    on weekends — so each switch is independent. Which slot the
+    Work/Pause/Start/End entities edit is still chosen by the
+    "Active mode" select.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(
+        self, device: ScentDiffuserDevice, entry: ConfigEntry, slot: int
+    ) -> None:
+        self._slot = slot
+        self._device = device
+        self._attr_name = f"Timer slot {ROMAN[slot]}"
+        self._attr_unique_id = f"{device.unique_id}_slot_{slot}"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def is_on(self) -> bool | None:
+        timers = self._device.state.b501f_timers
+        if not timers or self._slot > len(timers):
+            return None
+        return bool(timers[self._slot - 1].get("enabled"))
+
+    @property
+    def available(self) -> bool:
+        return self._device.available
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        timers = self._device.state.b501f_timers
+        if not timers or self._slot > len(timers):
+            return {}
+        s = timers[self._slot - 1]
+        attrs = {}
+        if s.get("start_minutes") is not None:
+            attrs["window"] = (
+                f"{s['start_minutes'] // 60:02d}:"
+                f"{s['start_minutes'] % 60:02d}-"
+                f"{s.get('stop_minutes', 0) // 60:02d}:"
+                f"{s.get('stop_minutes', 0) % 60:02d}"
+            )
+        if s.get("run_seconds") is not None:
+            attrs["burst"] = f"{s['run_seconds']}s on / {s.get('pause_seconds', '?')}s off"
+        return attrs
+
+    async def async_turn_on(self, **kwargs) -> None:
+        if not await self._device.set_slot_enabled(self._slot, True):
+            raise ValueError(
+                f"B501F slot {self._slot} enable failed on {self._device.name}"
+            )
+
+    async def async_turn_off(self, **kwargs) -> None:
+        if not await self._device.set_slot_enabled(self._slot, False):
+            raise ValueError(
+                f"B501F slot {self._slot} disable failed on {self._device.name}"
+            )

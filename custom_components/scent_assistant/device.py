@@ -652,11 +652,11 @@ class ScentDiffuserDevice:
         self._recent_notifications.append(raw.hex())
         if len(self._recent_notifications) > 20:
             del self._recent_notifications[0]
-        # B501F: surface the timer-table (0x88) raw bytes at WARNING level
-        # (HA core-level log filter is WARNING; INFO is hidden by default so
-        # these would never show up without toggling integration debug).
+        # B501F: log the full 0x88 timer-table read (DEBUG — byte-level dump
+        # is for protocol debugging, not normal operation). Toggle via
+        # `logger: custom_components.scent_assistant: debug` in configuration.
         if isinstance(self._protocol, B501FBleProtocol) and len(raw) >= 5 and raw[3] == 0x88:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "B501F 0x88 RX (%d bytes): %s", len(raw), raw.hex(" "))
         updates = self._protocol.parse_notification(raw)
         if not updates:
@@ -951,7 +951,7 @@ class ScentDiffuserDevice:
         target = dict(base[slot - 1])
         target["enabled"] = bool(enabled)
         cmd = self._protocol.build_set_timer_slot(target)
-        _LOGGER.warning(
+        _LOGGER.debug(
             "B501F 0x14 TX slot %d en=%s (%d bytes): %s",
             slot, int(bool(enabled)), len(cmd), cmd.hex(" ")
         )
@@ -1243,11 +1243,11 @@ class ScentDiffuserDevice:
                 slot["stop_minutes"] = e_h * 60 + e_m
                 slot["run_seconds"] = work
                 slot["pause_seconds"] = pause
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "B501F 0x14 schedule TX slot %d %02d:%02d-%02d:%02d w=%d p=%d",
                     slot["serial"], s_h, s_m, e_h, e_m, work, pause)
                 cmd = self._protocol.build_set_timer_slot(slot)
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "B501F 0x14 schedule payload (%d bytes): %s",
                     len(cmd), cmd.hex(" "))
 
