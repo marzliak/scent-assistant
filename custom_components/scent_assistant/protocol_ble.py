@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 from .const import (
@@ -2252,9 +2252,51 @@ class B501FBleProtocol(BleProtocol):
         return self._build(B501F_CMD_HANDSHAKE_3)
 
     def build_time_sync(self, now: datetime | None = None) -> bytes | None:
+        """B501F time sync — wall-clock-as-epoch semantics.
+
+        The Scent Tech app (BleUtils.getUnixTime) sends::
+
+            changeTimeZone(new Date(), UTC, TimeZone.getDefault()) / 1000
+
+        which is *the local wall-clock reinterpreted as a UTC epoch* — i.e.
+        the current São Paulo clock 20:10 yields the numeric value of
+        2026-09-13 **20:10** (Z) as a 32-bit Unix seconds. The device's
+        internal clock then reads off that epoch in its own "local time"
+        and evaluates each slot's start/stop window (minutes since
+        midnight) against it — so a slot of 19:00–22:00 fires exactly
+        when the *local* clock is between 19:00 and 22:00.
+
+        If we send the true UTC epoch instead (23:10 at 20:10 SP), the
+        device's 23:10 is *later* than the 22:00 end, and the firmware
+        powers on but stays idle. That's the 3-hour offset bug here
+        fixes.
+
+        ``now`` is expected to be either:
+        * a naive datetime in *local* wall time (e.g. the Android device's
+          ``new Date()`` when the phone is in São Paulo); or
+        * a tz-aware datetime (HA's ``dt_util.now()`` returns this with
+          HA's configured timezone — ``America/Sao_Paulo``).
+
+        In both cases the value we send is *the wall-clock interpreted
+        as if it were UTC* — matching the Java app exactly.
+
+        The default uses ``homeassistant.util.dt.now()`` (HA's configured
+        TZ, America/Sao_Paulo here) rather than the container's
+        ``datetime.now()`` which returns UTC — the container runs UTC, so
+        naive ``now()`` is the *wrong* wall-clock and would give the same
+        3h bug.
+        """
         if now is None:
-            now = datetime.now()
-        ts = int(now.timestamp()) & 0xFFFFFFFF
+            # HA local (America/Sao_Paulo) wall-clock, tz-aware.
+            from homeassistant.util import dt as dt_util
+            now = dt_util.now()
+        # Reduce to a naive wall-clock datetime: if already aware, take its
+        # own timezone's wall clock; if naive, assume already wall clock.
+        if now.tzinfo is not None:
+            wall = now.astimezone(now.tzinfo).replace(tzinfo=None)
+        else:
+            wall = now
+        ts = int(wall.replace(tzinfo=timezone.utc).timestamp()) & 0xFFFFFFFF
         return self._build(B501F_CMD_TIME_SYNC,
                            bytes([(ts >> 0) & 0xFF, (ts >> 8) & 0xFF,
                                   (ts >> 16) & 0xFF, (ts >> 24) & 0xFF]))
