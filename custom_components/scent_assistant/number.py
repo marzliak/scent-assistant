@@ -27,6 +27,8 @@ async def async_setup_entry(
         async_add_entities([ScentimentLevelNumber(device, entry)])
         return
 
+    is_cloud = entry.data.get("connection_mode") == "cloud"
+
     entities: list[NumberEntity] = [
         WorkDurationNumber(device, entry),
         PauseDurationNumber(device, entry),
@@ -35,6 +37,10 @@ async def async_setup_entry(
         entities.append(ScentMarketingIntensityNumber(device, entry))
     if device.device_type == DeviceType.AROMA_LINK:
         entities.append(MomentaryDurationNumber(device, entry))
+    if device.device_type == DeviceType.B501F and not is_cloud:
+        for slot_no in range(1, 6):
+            entities.append(B501FSlotWorkNumber(device, entry, slot_no))
+            entities.append(B501FSlotPauseNumber(device, entry, slot_no))
     async_add_entities(entities)
 
 
@@ -229,3 +235,99 @@ class ScentimentLevelNumber(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         await self._device.set_level(int(value))
+
+
+# --- B501F per-slot duration entities (work / pause) ----------------------
+
+_B501F_ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V"}
+
+
+def _b501f_slot(device: ScentDiffuserDevice, slot: int) -> dict | None:
+    """Return the cached timer record for a B501F slot, or None."""
+    timers = device.state.b501f_timers
+    if timers and 1 <= slot <= len(timers):
+        return timers[slot - 1]
+    return None
+
+
+class B501FSlotWorkNumber(NumberEntity):
+    """Spray (on) duration in seconds for one B501F timer slot.
+
+    Writing it re-saves that slot's full 16-byte record via CMD 0x14 —
+    the same single-slot command the Scent Tech app uses — so every
+    other slot is left untouched on the firmware.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:timer"
+    _attr_native_unit_of_measurement = "s"
+    _attr_native_min_value = 1
+    _attr_native_max_value = 600
+    _attr_native_step = 1
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry, slot: int) -> None:
+        self._device = device
+        self._slot = slot
+        self._attr_name = f"Slot {_B501F_ROMAN[slot]} Work Duration"
+        self._attr_unique_id = f"{device.unique_id}_slot_{slot}_work"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        rec = _b501f_slot(self._device, self._slot)
+        if rec is None:
+            return None
+        return rec.get("run_seconds")
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and _b501f_slot(self._device, self._slot) is not None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._device.set_slot_schedule(self._slot, work_seconds=int(value))
+
+
+class B501FSlotPauseNumber(NumberEntity):
+    """Pause (off) duration between sprays, in seconds, for one B501F slot."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:timer-pause"
+    _attr_native_unit_of_measurement = "s"
+    _attr_native_min_value = 1
+    _attr_native_max_value = 3600
+    _attr_native_step = 1
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry, slot: int) -> None:
+        self._device = device
+        self._slot = slot
+        self._attr_name = f"Slot {_B501F_ROMAN[slot]} Pause Duration"
+        self._attr_unique_id = f"{device.unique_id}_slot_{slot}_pause"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        rec = _b501f_slot(self._device, self._slot)
+        if rec is None:
+            return None
+        return rec.get("pause_seconds")
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and _b501f_slot(self._device, self._slot) is not None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self._device.set_slot_schedule(self._slot, pause_seconds=int(value))

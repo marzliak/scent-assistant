@@ -889,6 +889,63 @@ class ScentDiffuserDevice:
                 "the diffuser may still be running", self.name,
             )
 
+    async def set_slot_schedule(
+        self,
+        slot: int,
+        start_minutes: int | None = None,
+        stop_minutes: int | None = None,
+        work_seconds: int | None = None,
+        pause_seconds: int | None = None,
+    ) -> bool:
+        """Write one B501F timer slot (0x14, one 16-byte record).
+
+        Only the fields the caller passes are overridden; everything
+        else (enabled, serial, mode, timer_id) is preserved verbatim
+        from the last 0x88 read, matching the app's behaviour where a
+        per-field edit re-saves the full record unchanged except for
+        the field the user touched.
+        """
+        if not isinstance(self._protocol, B501FBleProtocol) or not self._ble_address:
+            return False
+        base = self._state.b501f_timers
+        if not base or not (1 <= slot <= len(base)):
+            _LOGGER.warning("B501F slot %d not found on %s", slot, self.name)
+            return False
+        rec = dict(base[slot - 1])
+        if start_minutes is not None:
+            rec["start_minutes"] = int(start_minutes)
+        if stop_minutes is not None:
+            rec["stop_minutes"] = int(stop_minutes)
+        if work_seconds is not None:
+            rec["run_seconds"] = int(work_seconds)
+        if pause_seconds is not None:
+            rec["pause_seconds"] = int(pause_seconds)
+        cmd = self._protocol.build_set_timer_slot(rec)
+        _LOGGER.debug(
+            "B501F slot %d write: %02d:%02d-%02d:%02d w=%ds p=%ds %s",
+            slot,
+            rec["start_minutes"] // 60, rec["start_minutes"] % 60,
+            rec["stop_minutes"] // 60, rec["stop_minutes"] % 60,
+            rec["run_seconds"], rec["pause_seconds"],
+            cmd.hex(" "),
+        )
+        if await self._ble_execute(cmd):
+            slots = [dict(s) for s in base]
+            slots[slot - 1] = rec
+            self._state.b501f_timers = slots
+            # Refresh cached "active" fields so the shared (non-slot) entities
+            # also stay consistent if the caller is editing the active slot.
+            if self._state.b501f_active_slot in (None, slot):
+                self._state.start_hour = rec["start_minutes"] // 60
+                self._state.start_minute = rec["start_minutes"] % 60
+                self._state.end_hour = rec["stop_minutes"] // 60
+                self._state.end_minute = rec["stop_minutes"] % 60
+                self._state.work_seconds = rec["run_seconds"]
+                self._state.pause_seconds = rec["pause_seconds"]
+            self._notify_state_changed()
+            return True
+        return False
+
     async def set_fan(self, on: bool) -> bool:
         """Turn fan on or off (Aroma-Link + Scent Marketing AK)."""
         if not self._ble_address:

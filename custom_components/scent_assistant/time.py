@@ -25,10 +25,16 @@ async def async_setup_entry(
     if device.device_type == DeviceType.SCENTIMENT:
         return
 
-    async_add_entities([
+    entities: list[TimeEntity] = [
         DiffuserStartTime(device, entry),
         DiffuserEndTime(device, entry),
-    ])
+    ]
+    is_cloud = entry.data.get("connection_mode") == "cloud"
+    if device.device_type == DeviceType.B501F and not is_cloud:
+        for slot_no in range(1, 6):
+            entities.append(B501FSlotStartTime(device, entry, slot_no))
+            entities.append(B501FSlotEndTime(device, entry, slot_no))
+    async_add_entities(entities)
 
 
 class DiffuserStartTime(TimeEntity):
@@ -115,3 +121,92 @@ class DiffuserEndTime(TimeEntity):
             work_seconds=self._device.state.work_seconds or 10,
             pause_seconds=self._device.state.pause_seconds or 120,
         )
+
+
+# --- B501F per-slot time entities (start / end) ---------------------------
+
+_B501F_ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V"}
+
+
+def _b501f_slot(device: ScentDiffuserDevice, slot: int) -> dict | None:
+    """Return the cached timer record for a B501F slot, or None."""
+    timers = device.state.b501f_timers
+    if timers and 1 <= slot <= len(timers):
+        return timers[slot - 1]
+    return None
+
+
+class B501FSlotStartTime(TimeEntity):
+    """Start time for one B501F timer slot's daily window.
+
+    Writing it re-saves that slot's 16-byte record (CMD 0x14); the end
+    time and burst durations of the same slot are preserved verbatim.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:clock-start"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry, slot: int) -> None:
+        self._device = device
+        self._slot = slot
+        self._attr_name = f"Slot {_B501F_ROMAN[slot]} Start Time"
+        self._attr_unique_id = f"{device.unique_id}_slot_{slot}_start"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> time | None:
+        rec = _b501f_slot(self._device, self._slot)
+        if rec is None:
+            return None
+        mins = rec.get("start_minutes") or 0
+        return time(mins // 60, mins % 60)
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and _b501f_slot(self._device, self._slot) is not None
+
+    async def async_set_value(self, value: time) -> None:
+        await self._device.set_slot_schedule(
+            self._slot, start_minutes=value.hour * 60 + value.minute)
+
+
+class B501FSlotEndTime(TimeEntity):
+    """End time for one B501F timer slot's daily window."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:clock-end"
+
+    def __init__(self, device: ScentDiffuserDevice, entry: ConfigEntry, slot: int) -> None:
+        self._device = device
+        self._slot = slot
+        self._attr_name = f"Slot {_B501F_ROMAN[slot]} End Time"
+        self._attr_unique_id = f"{device.unique_id}_slot_{slot}_end"
+        self._attr_device_info = device.device_info
+        device.register_state_callback(self._on_state_update)
+
+    def _on_state_update(self) -> None:
+        if self.hass is None:
+            return
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> time | None:
+        rec = _b501f_slot(self._device, self._slot)
+        if rec is None:
+            return None
+        mins = rec.get("stop_minutes") or 0
+        return time(mins // 60, mins % 60)
+
+    @property
+    def available(self) -> bool:
+        return self._device.available and _b501f_slot(self._device, self._slot) is not None
+
+    async def async_set_value(self, value: time) -> None:
+        await self._device.set_slot_schedule(
+            self._slot, stop_minutes=value.hour * 60 + value.minute)
